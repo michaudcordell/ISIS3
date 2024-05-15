@@ -5,28 +5,29 @@ For more details about the LICENSE terms and the AUTHORS, you will
 find files of those names at the top level of this repository. **/
 
 /* SPDX-License-Identifier: CC0-1.0 */
-
-#include "ProcessByLine.h"
-#include "SpecialPixel.h"
-#include "Message.h"
-#include "Camera.h"
-#include "iTime.h"
-#include "IException.h"
-#include "TextFile.h"
-#include "Brick.h"
-#include "Table.h"
-#include "PvlGroup.h"
-#include "Statistics.h"
-#include "UserInterface.h"
 #include "lronaccal.h"
+
 #include <fstream>
+#include <vector>
+
 #include <QTextStream>
 #include <QDir>
 #include <QRegExp>
 #include <QString>
-#include <vector>
 
-using namespace std;
+#include "Brick.h"
+#include "Camera.h"
+#include "IException.h"
+#include "iTime.h"
+#include "Message.h"
+#include "ProcessByLine.h"
+#include "PvlGroup.h"
+#include "SpecialPixel.h"
+#include "Statistics.h"
+#include "Table.h"
+#include "TextFile.h"
+#include "UserInterface.h"
+
 namespace Isis {
 
   // Working functions and parameters
