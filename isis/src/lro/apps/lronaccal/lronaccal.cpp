@@ -103,42 +103,72 @@ namespace Isis {
                                      double radianceRight);
 
   /**
-    * @brief  Calling method of the application
-    *
-    * Performs radiometric corrections to images acquired by the Narrow Angle
-    *    Camera aboard the Lunar Reconnaissance Orbiter spacecraft.
-    *
-    * @param ui The user interfact to parse the parameters from. 
-    */
-  void lronaccal(UserInterface &ui){
-     //Cube *iCube = p.SetInputCube("FROM", OneBand);
+   * @brief Calling method of the application
+   *
+   * Performs radiometric corrections to images acquired by the Narrow Angle
+   * Camera aboard the Lunar Reconnaissance Orbiter spacecraft.
+   *
+   * @param ui The user interface to parse the parameters from. 
+   */
+  void lronaccal(UserInterface &ui) {
     Cube iCube(ui.GetCubeName("FROM"));
     lronaccal(&iCube, ui);
   }
 
   /**
-    * This is the main constructor lronaccal method. Lronaccal is used to calibrate LRO images
-    * 
-    * @internal
-    *   @history 2020-01-06 Victor Silva - Added option for base calibration directory
-    *   @history 2020-07-19 Victor Silva - Updated dark calibration to use dark file option
-    *                                      custom, nearest dark, or nearest dark pair.
-    *   @history 2021-01-09 Victor Silva - Added code to check for exp_code = zero and if so
-    *                                      then use only exp_code_zero dark files for dark calibration
-    *  @history 2022-04-18 Victor Silva - Refactored to make callable for GTest framework
-    *
-    */
+   * This is the main constructor lronaccal method. Lronaccal is used to calibrate LRO images.
+   * 
+   * @internal
+   *   @history 2020-01-06 Victor Silva - Added option for base calibration directory
+   *   @history 2020-07-19 Victor Silva - Updated dark calibration to use dark file option
+   *                                      custom, nearest dark, or nearest dark pair.
+   *   @history 2021-01-09 Victor Silva - Added code to check for exp_code = zero and if so
+   *                                      then use only exp_code_zero dark files for dark calibration
+   *  @history 2022-04-18 Victor Silva - Refactored to make callable for GTest framework
+   *  @history 2024-05-15 Cordell Michaud - Refactored to not use global variables
+   */
   void lronaccal(Cube *iCube, UserInterface &ui) {
-    ResetGlobals();
+    constexpr int LINE_SIZE = 5064;
+    constexpr double KM_PER_AU = 149597871;
+
+    double exposure = 1.0; // Exposure duration
+    double solarDistance = 1.01; // average distance in [AU]
+    std::vector<int> maskedPixelsLeft;
+    std::vector<int> maskedPixelsRight;
+    double radianceLeft = 1.0;
+    double radianceRight = 1.0;
+    double iofLeft = 1.0;
+    double iofRight = 1.0;
+    bool summed = true;
+    bool masked = true;
+    bool dark = true;
+    bool nonlinear = true;
+    bool flatfield = true;
+    bool radiometric = true;
+    bool iof = true;
+    bool isLeftNac = true;
+    bool maskedLeftOnly = false;
+    bool nearestDarkPair = false;
+    bool nearestDark = false;
+    bool customDark = false;
+    std::vector<double> avgDarkLineCube0;
+    std::vector<double> avgDarkLineCube1;
+    std::vector<double> linearOffsetLine;
+    std::vector<double> darkTimes;
+    std::vector<double> weightedDarkTimeAvgs;
+    std::vector<double> flatfieldLine;
+    std::vector<std::vector<double>> linearityCoefficients;
+    double imgTime = 0.0;
+
     // We will be processing by line
     ProcessByLine p;
 
-    g_masked = ui.GetBoolean("MASKED");
-    g_dark = ui.GetBoolean("DARK");
-    g_nonlinear = ui.GetBoolean("NONLINEARITY");
-    g_flatfield = ui.GetBoolean("FLATFIELD");
-    g_radiometric = ui.GetBoolean("RADIOMETRIC");
-    g_iof = (ui.GetString("RADIOMETRICTYPE") == "IOF");
+    masked = ui.GetBoolean("MASKED");
+    dark = ui.GetBoolean("DARK");
+    nonlinear = ui.GetBoolean("NONLINEARITY");
+    flatfield = ui.GetBoolean("FLATFIELD");
+    radiometric = ui.GetBoolean("RADIOMETRIC");
+    iof = (ui.GetString("RADIOMETRICTYPE") == "IOF");
 
     Isis::Pvl lab(ui.GetCubeName("FROM"));
     Isis::PvlGroup &inst = lab.findGroup("Instrument", Pvl::Traverse);
@@ -146,60 +176,66 @@ namespace Isis {
     // Check if it is a NAC image
     QString instId = (QString) inst["InstrumentId"];
     instId = instId.toUpper();
-    if(instId != "NACL" && instId != "NACR") {
+    if (instId != "NACL" && instId != "NACR") {
       QString msg = "This is not a NAC image.  lrocnaccal requires a NAC image.";
       throw IException(IException::User, msg, _FILEINFO_);
     }
 
     // And check if it has already run through calibration
-    if(lab.findObject("IsisCube").hasGroup("Radiometry")) {
+    if (lab.findObject("IsisCube").hasGroup("Radiometry")) {
       QString msg = "This image has already been calibrated";
       throw IException(IException::User, msg, _FILEINFO_);
     }
 
-    if(lab.findObject("IsisCube").hasGroup("AlphaCube")) {
+    if (lab.findObject("IsisCube").hasGroup("AlphaCube")) {
       QString msg = "This application can not be run on any image that has been geometrically transformed (i.e. scaled, rotated, sheared, or reflected) or cropped.";
       throw IException(IException::User, msg, _FILEINFO_);
     }
 
-    if(instId == "NACL")
-      g_isLeftNac = true;
-    else
-      g_isLeftNac = false;
+    if (instId == "NACL") {
+      isLeftNac = true;
+    }
+    else {
+      isLeftNac = false;
+    }
 
-    if((int) inst["SpatialSumming"] == 1)
-      g_summed = false;
-    else
-      g_summed = true;
+    if (static_cast<int>(inst["SpatialSumming"]) == 1) {
+      summed = false;
+    }
+    else {
+      summed = true;
+    }
 
-    g_exposure = inst["LineExposureDuration"];
+    exposure = inst["LineExposureDuration"];
 
     p.SetInputCube(iCube, OneBand);
 
     // If there is any pixel in the image with a DN > 1000
     //  then the "left" masked pixels are likely wiped out and useless
-    if(iCube->statistics()->Maximum() > 1000)
-      g_maskedLeftOnly = true;
+    if (iCube->statistics()->Maximum() > 1000) {
+      maskedLeftOnly = true;
+    }
 
     QString flatFile, offsetFile, coefficientFile;
 
-    if(g_masked) {
+    if (masked) {
       QString maskedFile = ui.GetAsString("MASKEDFILE");
-      if(maskedFile.toLower() == "default" || maskedFile.length() == 0){
+      if (maskedFile.toLower() == "default" || maskedFile.length() == 0) {
         GetCalibrationDirectory("", maskedFile);
         maskedFile = maskedFile + instId + "_MaskedPixels.????.pvl";
       }
       FileName maskedFileName(maskedFile);
-      if(maskedFileName.isVersioned())
+      if (maskedFileName.isVersioned()) {
         maskedFileName = maskedFileName.highestVersion();
-      if(!maskedFileName.fileExists()) {
+      }
+      if (!maskedFileName.fileExists()) {
         QString msg = maskedFile + " does not exist.";
         throw IException(IException::User, msg, _FILEINFO_);
       }
       Pvl maskedPvl(maskedFileName.expanded());
       PvlKeyword maskedPixels;
       int cutoff;
-      if(g_summed) {
+      if (summed) {
         maskedPixels = maskedPvl["Summed"];
         cutoff = LINE_SIZE / 4;
       }
@@ -208,35 +244,40 @@ namespace Isis {
         cutoff = LINE_SIZE / 2;
       }
 
-      for(int i = 0; i < maskedPixels.size(); i++)
-        if((g_isLeftNac && toInt(maskedPixels[i]) < cutoff) || (!g_isLeftNac && toInt(maskedPixels[i]) > cutoff))
-          g_maskedPixelsLeft.push_back(toInt(maskedPixels[i]));
-        else
-          g_maskedPixelsRight.push_back(toInt(maskedPixels[i]));
+      for (int i = 0; i < maskedPixels.size(); i++) {
+        if ((isLeftNac && toInt(maskedPixels[i]) < cutoff) 
+            || (!isLeftNac && toInt(maskedPixels[i]) > cutoff)) {
+          maskedPixelsLeft.push_back(toInt(maskedPixels[i]));
+        }
+        else {
+          maskedPixelsRight.push_back(toInt(maskedPixels[i]));
+        }
+      }
     }
     
-    vector <QString> darkFiles;
+    std::vector<QString> darkFiles;
 
-    if(g_dark) {
+    if (dark) {
       QString darkFileType = ui.GetString("DARKFILETYPE");
       darkFileType = darkFileType.toUpper();
       if (darkFileType == "CUSTOM") {
-        g_customDark = true;
+        customDark = true;
         ui.GetAsString("DARKFILE", darkFiles);
       }
-      else if (darkFileType == "PAIR" || darkFileType == "")
-        g_nearestDarkPair = true;
-      else if (darkFileType == "NEAREST"){
-        g_nearestDark = true;
+      else if (darkFileType == "PAIR" || darkFileType == "") {
+        nearestDarkPair = true;
+      }
+      else if (darkFileType == "NEAREST") {
+        nearestDark = true;
       }
       else {
         QString msg = "Error: Dark File Type selection failed.";
         throw IException(IException::User, msg, _FILEINFO_);
       }
       //Options are NEAREST, PAIR, and CUSTOM
-      if(g_customDark){
-        if(darkFiles.size() == 1 && darkFiles[0] != "") {
-          CopyCubeIntoVector(darkFiles[0], g_avgDarkLineCube0);
+      if (customDark) {
+        if (darkFiles.size() == 1 && darkFiles[0] != "") {
+          CopyCubeIntoVector(darkFiles[0], avgDarkLineCube0);
         }
         else {
           QString msg = "Custom dark file not provided. Please provide file or choose another option.";
@@ -245,97 +286,103 @@ namespace Isis {
       }
       else {
         QString darkFile;
-        g_imgTime = iTime(inst["StartTime"][0]).Et();
+        imgTime = iTime(inst["StartTime"][0]).Et();
         GetCalibrationDirectory("nac_darks", darkFile);
         darkFile = darkFile + instId + "_AverageDarks_*T";
         
-        if(g_summed)
+        if (summed) {
           darkFile += "_Summed";
+        }
         // use exp0 dark files if cube's exp_code=0
         Isis::PvlGroup &pvl_archive_group = lab.findGroup("Archive", Pvl::Traverse);
-        if((int) pvl_archive_group["LineExposureCode"] == 0)
+        if (static_cast<int>(pvl_archive_group["LineExposureCode"]) == 0) {
           darkFile += "_exp0";
+        }
 
         darkFile += ".????.cub";
 
-        if(g_nearestDark){
+        if (nearestDark) {
           darkFiles.resize(1);
-          GetNearestDarkFile(darkFile, darkFiles[0]);
+          GetNearestDarkFile(imgTime, darkFile, darkFiles[0], avgDarkLineCube0);
         }
         else {
           darkFiles.resize(2);
-          GetNearestDarkFilePair(darkFile, darkFiles[0], darkFiles[1]);
+          GetNearestDarkFilePair(imgTime, darkFile, darkFiles[0], darkFiles[1], darkTimes, 
+                                 nearestDark, nearestDarkPair, avgDarkLineCube0, 
+                                 avgDarkLineCube1);
           //get weigted time avgs
-          if(g_darkTimes.size() == 2)
-            GetWeightedDarkAverages();
+          if (darkTimes.size() == 2) {
+            GetWeightedDarkAverages(imgTime, darkTimes, weightedDarkTimeAvgs);
+          }
         }
       }
     }
 
-    if(g_nonlinear) {
+    if (nonlinear) {
       offsetFile = ui.GetAsString("OFFSETFILE");
 
-      if(offsetFile.toLower() == "default" || offsetFile.length() == 0) {
+      if (offsetFile.toLower() == "default" || offsetFile.length() == 0) {
         GetCalibrationDirectory("", offsetFile);
         offsetFile = offsetFile + instId + "_LinearizationOffsets";
-        if(g_summed)
+        if (summed) {
           offsetFile += "_Summed";
+        }
         offsetFile += ".????.cub";
       }
-      CopyCubeIntoVector(offsetFile, g_linearOffsetLine);
+      CopyCubeIntoVector(offsetFile, linearOffsetLine);
       coefficientFile = ui.GetAsString("NONLINEARITYFILE");
-      if(coefficientFile.toLower() == "default" || coefficientFile.length() == 0) {
+      if (coefficientFile.toLower() == "default" || coefficientFile.length() == 0) {
         GetCalibrationDirectory("", coefficientFile);
         coefficientFile = coefficientFile + instId + "_LinearizationCoefficients.????.txt";
       }
-      ReadTextDataFile(coefficientFile, g_linearityCoefficients);
+      ReadTextDataFile(coefficientFile, linearityCoefficients);
     }
 
-    if(g_flatfield) {
+    if (flatfield) {
       flatFile = ui.GetAsString("FLATFIELDFILE");
 
-      if(flatFile.toLower() == "default" || flatFile.length() == 0) {
+      if (flatFile.toLower() == "default" || flatFile.length() == 0) {
         GetCalibrationDirectory("", flatFile);
         flatFile = flatFile + instId + "_Flatfield";
-        if(g_summed)
+        if (summed) {
           flatFile += "_Summed";
+        }
         flatFile += ".????.cub";
       }
-      CopyCubeIntoVector(flatFile, g_flatfieldLine);
+      CopyCubeIntoVector(flatFile, flatfieldLine);
     }
 
-    if(g_radiometric) {
+    if (radiometric) {
       QString radFile = ui.GetAsString("RADIOMETRICFILE");
 
-      if(radFile.toLower() == "default" || radFile.length() == 0){
+      if (radFile.toLower() == "default" || radFile.length() == 0) {
         GetCalibrationDirectory("", radFile);
         radFile = radFile + "NAC_RadiometricResponsivity.????.pvl";
       }
 
       FileName radFileName(radFile);
-      if(radFileName.isVersioned())
+      if (radFileName.isVersioned()) {
         radFileName = radFileName.highestVersion();
-      if(!radFileName.fileExists()) {
+      }
+      if (!radFileName.fileExists()) {
         QString msg = radFile + " does not exist.";
         throw IException(IException::User, msg, _FILEINFO_);
       }
 
       Pvl radPvl(radFileName.expanded());
 
-      if(g_iof) {
+      if (iof) {
         iTime startTime((QString) inst["StartTime"]);
 
         try {
           Camera *cam;
           cam = iCube->camera();
           cam->setTime(startTime);
-          g_solarDistance = cam->sunToBodyDist() / KM_PER_AU;
-
+          solarDistance = cam->sunToBodyDist() / KM_PER_AU;
         }
         catch(IException &e) {
           // Failed to instantiate a camera, try furnishing kernels directly
           try {
-
             double etStart = startTime.Et();
             // Get the distance between the Moon and the Sun at the given time in
             // Astronomical Units (AU)
@@ -351,7 +398,7 @@ namespace Isis {
             furnsh_c(pckKernel3.toLatin1().data());
             double sunpos[6], lt;
             spkezr_c("sun", etStart, "MOON_ME", "LT+S", "MOON", sunpos, &lt);
-            g_solarDistance = vnorm_c(sunpos) / KM_PER_AU;
+            solarDistance = vnorm_c(sunpos) / KM_PER_AU;
             unload_c(bspKernel1.toLatin1().data());
             unload_c(bspKernel2.toLatin1().data());
             unload_c(pckKernel1.toLatin1().data());
@@ -363,67 +410,116 @@ namespace Isis {
             throw IException(e, IException::User, msg, _FILEINFO_);
           }
         }
-        g_iofLeft = radPvl["IOF_LEFT"];
-        g_iofRight = radPvl["IOF_RIGHT"];
+        iofLeft = radPvl["IOF_LEFT"];
+        iofRight = radPvl["IOF_RIGHT"];
       }
       else {
-        g_radianceLeft = radPvl["Radiance_LEFT"];
-        g_radianceRight = radPvl["Radiance_RIGHT"];
+        radianceLeft = radPvl["Radiance_LEFT"];
+        radianceRight = radPvl["Radiance_RIGHT"];
       }
     }
+
+    /**
+     * @brief This method processes buffer by line to calibrate.
+     *
+     * @param[in] in Buffer to hold 1 line of cube data
+     * @param[out] out Buffer to hold 1 line of cube data
+     *
+     */
+    auto Calibrate = [masked, dark, nonlinear, flatfield, radiometric, summed, 
+                      maskedLeftOnly, nearestDarkPair, iof, isLeftNac, exposure, 
+                      solarDistance, iofLeft, iofRight, radianceLeft, radianceRight, 
+                      &maskedPixelsLeft, &maskedPixelsRight, avgDarkLineCube0, 
+                      &avgDarkLineCube1, &weightedDarkTimeAvgs, &linearOffsetLine, 
+                      &linearityCoefficients, &flatfieldLine](Buffer &in, Buffer &out) -> void {
+      for (int i = 0; i < in.size(); i++) {
+        out[i] = in[i];
+      }
+
+      if (masked) {
+        RemoveMaskedOffset(out, summed, maskedLeftOnly, maskedPixelsLeft, maskedPixelsRight);
+      }
+
+      if (dark) {
+        CorrectDark(out, nearestDarkPair, avgDarkLineCube0, avgDarkLineCube1, weightedDarkTimeAvgs);
+      }
+
+      if (nonlinear) {
+        CorrectNonlinearity(out, linearOffsetLine, linearityCoefficients, summed);
+      }
+
+      if (flatfield) {
+        CorrectFlatfield(out, flatfieldLine);
+      }
+
+      if (radiometric) {
+        RadiometricCalibration(out, exposure, iof, isLeftNac, solarDistance, iofLeft, iofRight, 
+          radianceLeft, radianceRight);
+      }
+    };
+
     // Setup the output cube
-    Cube * oCube = p.SetOutputCube(ui.GetCubeName("TO"), ui.GetOutputAttribute("TO")); 
+    Cube *oCube = p.SetOutputCube(ui.GetCubeName("TO"), ui.GetOutputAttribute("TO")); 
     // Start the line-by-line calibration sequence
     p.StartProcess(Calibrate);
 
     PvlGroup calgrp("Radiometry");
-    if(g_masked) {
+    if (masked) {
       PvlKeyword darkColumns("DarkColumns");
-      for(unsigned int i = 0; i < g_maskedPixelsLeft.size(); i++)
-        darkColumns += toString(g_maskedPixelsLeft[i]);
-      for(unsigned int i = 0; i < g_maskedPixelsRight.size(); i++)
-        darkColumns += toString(g_maskedPixelsRight[i]);
+      for (std::size_t i = 0; i < maskedPixelsLeft.size(); i++) {
+        darkColumns += toString(maskedPixelsLeft[i]);
+      }
+      for (std::size_t i = 0; i < maskedPixelsRight.size(); i++) {
+        darkColumns += toString(maskedPixelsRight[i]);
+      }
       calgrp += darkColumns;
     }
 
-    if(g_dark){
+    if (dark) {
       PvlKeyword darks("DarkFiles");
       darks.addValue(darkFiles[0]);
-      if(g_nearestDark)
+      if (nearestDark) {
         calgrp += PvlKeyword("DarkFileType", "NearestDarkFile");
-      else if (g_nearestDarkPair){
+      }
+      else if (nearestDarkPair) {
         calgrp += PvlKeyword("DarkFileType", "NearestDarkFilePair");
         darks.addValue(darkFiles[1]);
       }
-      else
+      else {
         calgrp += PvlKeyword("DarkFileType", "CustomDarkFile");
+      }
 
       calgrp += darks;
     }
 
-    if(g_nonlinear) {
+    if (nonlinear) {
       calgrp += PvlKeyword("NonlinearOffset", offsetFile);
       calgrp += PvlKeyword("LinearizationCoefficients", coefficientFile);
     }
 
-    if(g_flatfield)
+    if (flatfield) {
       calgrp += PvlKeyword("FlatFile", flatFile);
-    if(g_radiometric) {
-      if(g_iof) {
+    }
+    if (radiometric) {
+      if (iof) {
         calgrp += PvlKeyword("RadiometricType", "IOF");
-        if(g_isLeftNac)
-          calgrp += PvlKeyword("ResponsivityValue", toString(g_iofLeft));
-        else
-          calgrp += PvlKeyword("ResponsivityValue", toString(g_iofRight));
+        if (isLeftNac) {
+          calgrp += PvlKeyword("ResponsivityValue", toString(iofLeft));
+        }
+        else {
+          calgrp += PvlKeyword("ResponsivityValue", toString(iofRight));
+        }
       }
       else {
         calgrp += PvlKeyword("RadiometricType", "AbsoluteRadiance");
-        if(g_isLeftNac)
-          calgrp += PvlKeyword("ResponsivityValue", toString(g_radianceLeft));
-        else
-          calgrp += PvlKeyword("ResponsivityValue", toString(g_radianceRight));
+        if (isLeftNac) {
+          calgrp += PvlKeyword("ResponsivityValue", toString(radianceLeft));
+        }
+        else {
+          calgrp += PvlKeyword("ResponsivityValue", toString(radianceRight));
+        }
       }
-      calgrp += PvlKeyword("SolarDistance", toString(g_solarDistance));
+      calgrp += PvlKeyword("SolarDistance", toString(solarDistance));
     }
 
     oCube->putGroup(calgrp);
