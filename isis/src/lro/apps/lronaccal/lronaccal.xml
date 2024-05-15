@@ -156,6 +156,9 @@
     <change name="Victor Silva" date="2020-10-04">
       Updated dark calibration documentation to provide more clarity to dark file options
     </change>
+    <change name="Cordell Michaud" date="2024-05-15">
+      Refactored to no longer use global variables and externally-linked helper functions
+    </change>
   </history>
 
   <category>
