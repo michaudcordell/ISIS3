@@ -29,62 +29,78 @@ find files of those names at the top level of this repository. **/
 #include "UserInterface.h"
 
 namespace Isis {
+  static constexpr int MASKED_PIXEL_VALUES = 8;
+  static constexpr double MAXNONLIN = 600;
 
-  // Working functions and parameters
-  void ResetGlobals();
-  void CopyCubeIntoVector(QString &fileString, vector<double> &data);
-  void ReadTextDataFile(QString &fileString, vector<double> &data);
-  void ReadTextDataFile(QString &fileString, vector<vector<double> > &data);
-  void Calibrate(Buffer &in, Buffer &out);
-  void RemoveMaskedOffset(Buffer &line);
-  void CorrectDark(Buffer &in);
-  void CorrectNonlinearity(Buffer &in);
-  void CorrectFlatfield(Buffer &in);
-  void RadiometricCalibration(Buffer &in);
-  void GetNearestDarkFile(QString fileString, QString &file);
-  void GetNearestDarkFilePair(QString &fileString, QString &file0, QString &file1);
-  void GetCalibrationDirectory(QString calibrationType, QString &calibrationDirectory);
-  void GetWeightedDarkAverages();
-  bool AllowedSpecialPixelType(double pixelValue);
+  // Anonymous namespace for internal linkage of DarkFileComparison
+  namespace {
+    /**
+     * DarkFileInfo comparison object.
+     *
+     * Used for sorting DarkFileInfo objects. Sort first by difference from NAC time
+     *
+     */
+    struct DarkFileComparison {
+      int nacTime;
 
-  #define LINE_SIZE 5064
-  #define MAXNONLIN 600
-  #define SOLAR_RADIUS 695500
-  #define KM_PER_AU 149597871
-  #define MASKED_PIXEL_VALUES 8
+      DarkFileComparison(int nacTime)
+      {
+        this->nacTime = nacTime;
+      }
 
-  /**
-  * DarkFileInfo comparison object.
-  *
-  * Used for sorting DarkFileInfo objects. Sort first by difference from NAC time
-  *
-  */
-  struct DarkFileComparison {
-    int nacTime;
+      // sort dark files by distance from NAC time
+      bool operator() (int A, int B) {
+        return (abs(nacTime - A) < abs(nacTime - B));
+      }
+    };
+  }
 
-    DarkFileComparison(int nacTime)
-    {
-      this->nacTime = nacTime;
-    }
+  static void CopyCubeIntoVector(QString &fileString, std::vector<double> &data);
+  static void ReadTextDataFile(QString &fileString, std::vector<double> &data);
+  static void ReadTextDataFile(QString &fileString, std::vector<std::vector<double> > &data);
+  static void GetNearestDarkFile(double imgTime, 
+                                 const QString &fileString, 
+                                 QString &file, 
+                                 std::vector<double> &avgDarkLineCube);
+  static void GetNearestDarkFilePair(double imgTime, 
+                                     const QString &fileString, 
+                                     QString &file0, 
+                                     QString &file1, 
+                                     std::vector<double> &darkTimes, 
+                                     bool &nearestDark, 
+                                     bool &nearestDarkPair,
+                                     std::vector<double> &avgDarkLineCube0,
+                                     std::vector<double> &avgDarkLineCube1);
+  static void GetCalibrationDirectory(QString calibrationType, QString &calibrationDirectory);
+  static void GetWeightedDarkAverages(double imgTime, 
+                                      const std::vector<double> &darkTimes, 
+                                      std::vector<double> &weightedDarkTimeAvgs);
+  static bool AllowedSpecialPixelType(double pixelValue);
 
-    // sort dark files by distance from NAC time
-    bool operator() ( int A,  int B) {
-      if (abs(nacTime - A) < abs(nacTime - B))
-        return true;
-      return false;
-    }
-  };
-
-  double g_radianceLeft, g_radianceRight, g_iofLeft, g_iofRight, g_imgTime;
-  double g_exposure; // Exposure duration
-  double g_solarDistance; // average distance in [AU]
-
-  bool g_summed, g_masked, g_maskedLeftOnly, g_dark, g_nonlinear, g_flatfield, g_radiometric, g_iof, g_isLeftNac;
-  bool g_nearestDark, g_nearestDarkPair, g_customDark;
-  vector<int> g_maskedPixelsLeft, g_maskedPixelsRight;
-  vector<double> g_avgDarkLineCube0, g_avgDarkLineCube1, g_linearOffsetLine, g_flatfieldLine, g_darkTimes, g_weightedDarkTimeAvgs;
-  vector<vector<double> > g_linearityCoefficients;
-  Buffer *g_darkCube0, *g_darkCube1;
+  static void RemoveMaskedOffset(Buffer &inout, 
+                                 bool summed,
+                                 bool maskedLeftOnly,
+                                 const std::vector<int> &maskedPixelsLeft, 
+                                 const std::vector<int> &maskedPixelsRight);
+  static void CorrectDark(Buffer &inout, 
+                          bool nearestDarkPair, 
+                          const std::vector<double> &avgDarkLineCube0, 
+                          const std::vector<double> &avgDarkLineCube1, 
+                          const std::vector<double> &weightedDarkTimeAvgs);
+  static void CorrectNonlinearity(Buffer &inout, 
+                                  const std::vector<double> &linearOffsetLine, 
+                                  const std::vector<std::vector<double>> &linearityCoefficients,
+                                  bool summed);
+  static void CorrectFlatfield(Buffer &inout, const std::vector<double> &flatfieldLine);
+  static void RadiometricCalibration(Buffer &inout, 
+                                     double exposure, 
+                                     bool iof, 
+                                     bool isLeftNac, 
+                                     double solarDistance,
+                                     double iofLeft, 
+                                     double iofRight, 
+                                     double radianceLeft, 
+                                     double radianceRight);
 
   /**
     * @brief  Calling method of the application
@@ -415,86 +431,59 @@ namespace Isis {
   }
 
   /**
-  * This method resets global variables
-  *
-  */
-  void ResetGlobals() {
-    g_exposure = 1.0; // Exposure duration
-    g_solarDistance = 1.01; // average distance in [AU]
-    g_maskedPixelsLeft.clear();
-    g_maskedPixelsRight.clear();
-    g_radianceLeft = 1.0;
-    g_radianceRight = 1.0;
-    g_iofLeft = 1.0;
-    g_iofRight = 1.0;
-    g_summed = true;
-    g_masked = true;
-    g_dark = true;
-    g_nonlinear = true;
-    g_flatfield = true;
-    g_radiometric = true;
-    g_iof = true;
-    g_isLeftNac = true;
-    g_maskedLeftOnly = false;
-    g_nearestDarkPair = false;
-    g_nearestDark = false;
-    g_customDark = false;
-    g_avgDarkLineCube0.clear();
-    g_avgDarkLineCube1.clear();
-    g_linearOffsetLine.clear();
-    g_darkTimes.clear();
-    g_weightedDarkTimeAvgs.clear();
-    g_flatfieldLine.clear();
-    g_linearityCoefficients.clear();
-    g_imgTime = 0.0;
-  }
-
-  /**
-  * This method processes buffer by line to calibrate
-  *
-  * @param in Buffer to hold 1 line of cube data
-  * @param out Buffer to hold 1 line of cube data
-  *
-  */
-  void Calibrate(Buffer &in, Buffer &out) {
-    for(int i = 0; i < in.size(); i++)
-      out[i] = in[i];
-
-    if(g_masked)
-      RemoveMaskedOffset(out);
-
-    if(g_dark)
-      CorrectDark(out);
-
-    if(g_nonlinear)
-      CorrectNonlinearity(out);
-
-    if(g_flatfield)
-      CorrectFlatfield(out);
-
-    if(g_radiometric)
-      RadiometricCalibration(out);
-  }
-
-  /**
-  * Read text data file - overloaded method
-  *
-  * @param fileString QString
-  * @param data vector of double
-  *
-  */
-  void ReadTextDataFile(QString &fileString, vector<double> &data) {
+   * @brief This method copies a cube into a vector.
+   *
+   * @param[in] fileString Cube file
+   * @param[out] data vector of double
+   *
+   */
+  static void CopyCubeIntoVector(QString &fileString, std::vector<double> &data) {
+    Cube cube;
     FileName filename(fileString);
-    if(filename.isVersioned())
+    if (filename.isVersioned()) {
       filename = filename.highestVersion();
-    if(!filename.fileExists()) {
+    }
+    if (!filename.fileExists()) {
+      QString msg = fileString + " does not exist.";
+      throw IException(IException::User, msg, _FILEINFO_);
+    }
+    cube.open(filename.expanded());
+    Brick brick(cube.sampleCount(), cube.lineCount(), cube.bandCount(), cube.pixelType());
+    brick.SetBasePosition(1, 1, 1);
+    cube.read(brick);
+    data.clear();
+    for (int i = 0; i < cube.sampleCount(); i++) {
+      data.push_back(brick[i]);
+    }
+
+    fileString = filename.original();
+
+    if (data.empty()) {
+      QString msg = "Copy from + " + fileString + " into vector failed.";
+      throw IException(IException::User, msg, _FILEINFO_);
+    }
+
+  }
+
+  /**
+   * Read text data file - overloaded method.
+   *
+   * @param[in] fileString Text file
+   * @param[out] data vector of double
+   */
+  static void ReadTextDataFile(QString &fileString, std::vector<double> &data) {
+    FileName filename(fileString);
+    if (filename.isVersioned()) {
+      filename = filename.highestVersion();
+    }
+    if (!filename.fileExists()) {
       QString msg = fileString + " does not exist.";
       throw IException(IException::User, msg, _FILEINFO_);
     }
     TextFile file(filename.expanded());
     QString lineString;
     unsigned int line = 0;
-    while(file.GetLine(lineString)) {
+    while (file.GetLine(lineString)) {
       data.push_back(toDouble(lineString.split(QRegExp("[ ,;]")).first()));
       line++;
     }
@@ -502,24 +491,24 @@ namespace Isis {
   }
 
   /**
-  * Read the text data file - overloaded method
-  *
-  * @param fileString QString
-  * @param data multi-dimensional vector of double
-  *
-  */
-  void ReadTextDataFile(QString &fileString, vector<vector<double> > &data) {
+   * Read text data file - overloaded method.
+   *
+   * @param[in] fileString Text file
+   * @param[out] data multi-dimensional vector of double
+   */
+  static void ReadTextDataFile(QString &fileString, std::vector<std::vector<double>> &data) {
     FileName filename(fileString);
-    if(filename.isVersioned())
+    if (filename.isVersioned()) {
       filename = filename.highestVersion();
-    if(!filename.fileExists()) {
+    }
+    if (!filename.fileExists()) {
       QString msg = fileString + " does not exist.";
       throw IException(IException::User, msg, _FILEINFO_);
     }
     TextFile file(filename.expanded());
     QString lineString;
-    while(file.GetLine(lineString)) {
-      vector<double> line;
+    while (file.GetLine(lineString)) {
+      std::vector<double> line;
       lineString = lineString.simplified().remove(QRegExp("^[ ,]*")).trimmed();
 
       QStringList lineTokens = lineString.split(QRegExp("[ ,]"), Qt::SkipEmptyParts);
@@ -534,179 +523,20 @@ namespace Isis {
   }
 
   /**
-  * Remove masked offset
-  *
-  * @param in Buffer
-  *
-  */
-  void RemoveMaskedOffset(Buffer &in) {
-    int numMasked = MASKED_PIXEL_VALUES;
-    if(g_summed)
-      numMasked /= 2;
-
-    vector<Statistics> statsLeft(numMasked, Statistics());
-    vector<Statistics> statsRight(numMasked, Statistics());
-
-    vector<int> leftRef(numMasked, 0);
-    vector<int> rightRef(numMasked, 0);
-
-    for(unsigned int i = 0; i < g_maskedPixelsLeft.size(); i++) {
-      statsLeft[g_maskedPixelsLeft[i] % numMasked].AddData(&in[g_maskedPixelsLeft[i]], 1);
-      leftRef[g_maskedPixelsLeft[i] % numMasked] += g_maskedPixelsLeft[i];
-    }
-
-    for(unsigned int i = 0; i < g_maskedPixelsRight.size(); i++) {
-      statsRight[g_maskedPixelsRight[i] % numMasked].AddData(&in[g_maskedPixelsRight[i]], 1);
-      rightRef[g_maskedPixelsRight[i] % numMasked] += g_maskedPixelsRight[i];
-    }
-
-    // left/rightRef is the center (average) of all the masked pixels in the set
-    for(int i = 0; i < numMasked; i++) {
-      leftRef[i] /= statsLeft[i].TotalPixels();
-      rightRef[i] /= statsRight[i].TotalPixels();
-    }
-
-    if(g_maskedLeftOnly) {
-      for(int i = 0; i < in.size(); i++) {
-        in[i] -= statsLeft[i % numMasked].Average();
-      }
-    }
-    else {
-      // If we are using both sides, we interpolate between them
-
-      for(int i = 0; i < in.size(); i++) {
-        in[i] -= (statsLeft[i % numMasked].Average() * (rightRef[i % numMasked] - i) + statsRight[i % numMasked].Average()
-                  * (i - leftRef[i % numMasked])) / (rightRef[i % numMasked] - leftRef[i % numMasked]);
-      }
-    }
-  }
-
-  /**
-  * Dark Correction - will find 2 nearest dark files to perform
-  *                   dark correction of the pixel being processed
-  *
-  * @param in Buffer
-  *
-  */
-  void CorrectDark(Buffer &in) {
-    for (int i = 0; i < in.size(); i++) {
-      if(g_nearestDarkPair &&
-        (!IsSpecial(in[i]) || AllowedSpecialPixelType(in[i])) &&
-        (!IsSpecial(g_avgDarkLineCube0[i]) || AllowedSpecialPixelType(g_avgDarkLineCube0[i])) &&
-        (!IsSpecial(g_avgDarkLineCube1[i]) || AllowedSpecialPixelType(g_avgDarkLineCube1[i])) &&
-        (!IsSpecial(in[i]) || AllowedSpecialPixelType(in[i])) ){
-        double w0 = g_weightedDarkTimeAvgs[0];
-        double w1 = g_weightedDarkTimeAvgs[1];
-        double pixelDarkAvg = (g_avgDarkLineCube0[i]*w0)+(g_avgDarkLineCube1[i]*w1);
-
-        in[i] -= pixelDarkAvg;
-
-      } else if
-        ((!IsSpecial(g_avgDarkLineCube0[i]) || AllowedSpecialPixelType(g_avgDarkLineCube0[i])) &&
-        (!IsSpecial(in[i]) || AllowedSpecialPixelType(in[i])) ) {
-
-        in[i] -= g_avgDarkLineCube0[i];
-
-      }
-      else {
-        in[i] = Isis::Null;
-      }
-    }
-  }
-
-  /**
-  * Correct non-linearity of the pixel being processed
-  *
-  *
-  * @param in Buffer
-  */
-  void CorrectNonlinearity(Buffer &in) {
-    for(int i = 0; i < in.size(); i++) {
-      if(!IsSpecial(in[i])) {
-        in[i] += g_linearOffsetLine[i];
-
-        if(in[i] < MAXNONLIN) {
-          if(g_summed)
-            in[i] -= (1.0 / (g_linearityCoefficients[2* i ][0] * pow(g_linearityCoefficients[2* i ][1], in[i])
-                            + g_linearityCoefficients[2* i ][2]) + 1.0 / (g_linearityCoefficients[2* i + 1][0] * pow(
-                                  g_linearityCoefficients[2* i + 1][1], in[i]) + g_linearityCoefficients[2* i + 1][2])) / 2;
-          else
-            in[i] -= 1.0 / (g_linearityCoefficients[i][0] * pow(g_linearityCoefficients[i][1], in[i])
-                            + g_linearityCoefficients[i][2]);
-        }
-      }
-      else
-        in[i] = Isis::Null;
-    }
-  }
-
-  void CorrectFlatfield(Buffer &in) {
-    for(int i = 0; i < in.size(); i++) {
-      if(!IsSpecial(in[i]) && g_flatfieldLine[i] > 0)
-        in[i] /= g_flatfieldLine[i];
-      else
-        in[i] = Isis::Null;
-    }
-  }
-
-  /**
-  * Radiometric Calibration of the pixel being processed
-  *
-  *
-  * @param in Buffer
-  */
-  void RadiometricCalibration(Buffer &in) {
-    for(int i = 0; i < in.size(); i++) {
-      if(!IsSpecial(in[i])) {
-        in[i] /= g_exposure;
-        if(g_iof) {
-          if(g_isLeftNac)
-            in[i] = in[i] * pow(g_solarDistance, 2) / g_iofLeft;
-          else
-            in[i] = in[i] * pow(g_solarDistance, 2) / g_iofRight;
-        }
-        else {
-          if(g_isLeftNac)
-            in[i] = in[i] / g_radianceLeft;
-          else
-            in[i] = in[i] / g_radianceRight;
-        }
-      }
-      else
-        in[i] = Isis::Null;
-    }
-  }
-
-  /**
-  * This method returns an QString containing the path of an
-  * LRO calibration directory
-  *
-  * @param calibrationType
-  * @param calibrationDirectory Path of the calibration directory
-  *
-  * @internal
-  *   @history 2020-01-06 Victor Silva - Added option for base calibration directory
-  */
-  void GetCalibrationDirectory(QString calibrationType, QString &calibrationDirectory) {
-    PvlGroup &dataDir = Preference::Preferences().findGroup("DataDirectory");
-    QString missionDir = (QString) dataDir["LRO"];
-    if(calibrationType != "")
-      calibrationType += "/";
-
-    calibrationDirectory = missionDir + "/calibration/" + calibrationType;
-  }
-
-  /**
-  * Finds the best dark files for NAC calibration.
-  *
-  * GetNearestDarkFile will get the dark file with the
-  * closest time (before or after) to the image time
-  * to be used for calibration.
-  *
-  * @param fileString String pattern defining dark files to search
-  * @param file0 Filename of dark file 1
-  */
-  void GetNearestDarkFile(QString fileString, QString &file) {
+   * @brief Finds the best dark file for NAC calibration and copies it into a vector.
+   *
+   * GetNearestDarkFile will get the dark file with the closest time (before or after) to the 
+   * image time to be used for calibration abnd copy it into a vector of doubles.
+   *
+   * @param[in] imgTime Image time
+   * @param[in] fileString String pattern defining dark files to search
+   * @param[out] file Filename of dark file
+   * @param[out] avgDarkLineCube Average dark line cube data for dark file
+   */
+  static void GetNearestDarkFile(double imgTime, 
+                                 const QString &fileString, 
+                                 QString &file, 
+                                 std::vector<double> &avgDarkLineCube) {
     FileName filename(fileString);
     QString basename = FileName(filename.baseName()).baseName(); // We do it twice to remove the ".????.cub"
     // create a regular expression to capture time from filenames
@@ -717,11 +547,11 @@ namespace Isis {
     QString filter(basename);
     filter.append(".*");
     // get a list of dark files that match our basename
-    QDir dir( filename.path(), filter );
-    vector<int> matchedDarkTimes;
+    QDir dir(filename.path(), filter);
+    std::vector<int> matchedDarkTimes;
     matchedDarkTimes.reserve(dir.count());
     // Loop through all files in the dir that match our basename and extract time
-    for (unsigned int i=0; i < dir.count(); i++) {
+    for (unsigned int i = 0; i < dir.count(); i++) {
       // match against our regular expression
       int pos = regex.indexIn(dir[i]);
       if (pos == -1) {
@@ -741,31 +571,45 @@ namespace Isis {
       matchedDarkTimes.push_back(fileTime);
     }
     // sort the files by distance from nac time
-    DarkFileComparison darkComp((int)g_imgTime);
+    DarkFileComparison darkComp(static_cast<int>(imgTime));
     sort(matchedDarkTimes.begin(), matchedDarkTimes.end(), darkComp);
     int darkTime = matchedDarkTimes[0];
     int fileTimeIndex = fileString.indexOf("*T");
     file = fileString;
     file.replace(fileTimeIndex, 1, toString(darkTime));
-    CopyCubeIntoVector(file, g_avgDarkLineCube0);
+    CopyCubeIntoVector(file, avgDarkLineCube);
   }
 
   /**
-  * Finds the best dark files for NAC calibration.
-  *
-  * GetNearestDarkFilePair will get the average between the two darks files
-  * that the image lies between (time-wise).
-
-  * If this pair is not found, the nearest dark file will be used
-  * for calibration.
-  *
-  * @param fileString String pattern defining dark files to search (ie. lro/calibration/nac_darks/NAC*_AverageDarks_*T_.????.cub)
-  * @param file0 Filename of dark file 1
-  * @param file1 Filename of dark file 2
-  */
-  void GetNearestDarkFilePair(QString &fileString, QString &file0, QString &file1) {
+   * @brief Finds the best dark files for NAC calibration.
+   *
+   * GetNearestDarkFilePair will get the average between the two darks files
+   * that the image lies between (time-wise) and copy them into vectors of doubles.
+   * If this pair is not found, the nearest dark file will be used
+   * for calibration.
+   *
+   * @param[in] imgTime Image time
+   * @param[in] fileString String pattern defining dark files to search (ie. lro/calibration/nac_darks/NAC*_AverageDarks_*T_.????.cub)
+   * @param[out] file0 Filename of dark file 1
+   * @param[out] file1 Filename of dark file 2
+   * @param[out] darkTimes Dark times
+   * @param[out] nearestDark Nearest dark should be used
+   * @param[out] nearestDarkPair Nearest dark pair should be used
+   * @param[out] avgDarkLineCube0 Average dark line cube data for dark file 1
+   * @param[out] avgDarkLineCube1 Average dark line cube data for dark file 2
+   */
+  static void GetNearestDarkFilePair(double imgTime, 
+                                    const QString &fileString, 
+                                    QString &file0, 
+                                    QString &file1, 
+                                    std::vector<double> &darkTimes, 
+                                    bool &nearestDark, 
+                                    bool &nearestDarkPair,
+                                    std::vector<double> &avgDarkLineCube0,
+                                    std::vector<double> &avgDarkLineCube1) {
     FileName filename(fileString);
-    QString basename = FileName(filename.baseName()).baseName(); // We do it twice to remove the ".????.cub"
+    // We use baseName() twice to remove the ".????.cub"
+    QString basename = FileName(filename.baseName()).baseName();
     // create a regular expression to capture time from filenames
     QString regexPattern(basename);
     regexPattern.replace("*", "([0-9\\.-]*)");
@@ -775,14 +619,14 @@ namespace Isis {
     filter.append(".*");
     // get a list of dark files that match our basename
     QDir dir( filename.path(), filter );
-    vector<int> matchedDarkTimes;
+    std::vector<int> matchedDarkTimes;
     matchedDarkTimes.reserve(dir.count());
-    if (dir.count() < 1){
+    if (dir.count() < 1) {
       QString msg = "Could not find any dark file of type " + filter + ".\n";
       throw IException(IException::User, msg, _FILEINFO_);
     }
     // Loop through all files in the dir that match our basename and extract time
-    for (unsigned int i=0; i < dir.count(); i++) {
+    for (unsigned int i = 0; i < dir.count(); i++) {
       // match against our regular expression
       int pos = regex.indexIn(dir[i]);
       if (pos == -1) {
@@ -803,136 +647,324 @@ namespace Isis {
       matchedDarkTimes.push_back(fileTime);
     }
     // sort the files by distance from nac time
-    DarkFileComparison darkComp((int)g_imgTime);
+    DarkFileComparison darkComp(static_cast<int>(imgTime));
     sort(matchedDarkTimes.begin(), matchedDarkTimes.end(), darkComp);
 
     int fileTimeIndex = fileString.indexOf("*T");
     int t0 = 0;
     int t1 = 0;
     //Let's find the first time before the image
-    for(size_t i = 0; i < matchedDarkTimes.size(); i++){
-      if(matchedDarkTimes[i] <= (int)g_imgTime){
+    for (size_t i = 0; i < matchedDarkTimes.size(); i++) {
+      if (matchedDarkTimes[i] <= static_cast<int>(imgTime)) {
         t0 = matchedDarkTimes[i];
         break;
       }
     }
     //Let's find the second time
     for (size_t i = 0; i < matchedDarkTimes.size(); i++) {
-      if (matchedDarkTimes[i] >= (int)g_imgTime) {
+      if (matchedDarkTimes[i] >= static_cast<int>(imgTime)) {
         t1 = matchedDarkTimes[i];
         break;
       }
     }
-    if((t0 && t1) && (t0!=t1)){
+    if ((t0 && t1) && (t0!=t1)) {
       int timeDayDiff =  abs(t1 -t0)/86400.0;
       
     //check time range between darks is within 45 day window
     if (timeDayDiff < 0  || timeDayDiff > 45) {
-        QString msg = "Could not find a pair of dark files within 45 day range that includes the image [" + basename + "]. Check to make sure your set of dark files is complete.\n";
+        QString msg = "Could not find a pair of dark files within 45 day range that includes the image [" 
+                    + basename + "]. Check to make sure your set of dark files is complete.\n";
         throw IException(IException::User, msg, _FILEINFO_);
       }
       else {
         file0 = fileString;
         file0.replace(fileTimeIndex, 1, toString(t0));
-        CopyCubeIntoVector(file0, g_avgDarkLineCube0);
-        g_darkTimes.push_back(t0);
+        CopyCubeIntoVector(file0, avgDarkLineCube0);
+        darkTimes.push_back(t0);
         file1 = fileString;
         file1.replace(fileTimeIndex, 1, toString(t1));
-        CopyCubeIntoVector(file1, g_avgDarkLineCube1);
-        g_darkTimes.push_back(t1);
+        CopyCubeIntoVector(file1, avgDarkLineCube1);
+        darkTimes.push_back(t1);
       }
     }
     else {
-      g_nearestDark = true;
-      g_nearestDarkPair = false;
+      nearestDark = true;
+      nearestDarkPair = false;
       int darkTime = matchedDarkTimes[0];
       file0 = fileString;
       file0.replace(fileTimeIndex, 1, toString(darkTime));
-      CopyCubeIntoVector(file0, g_avgDarkLineCube0);
-      g_darkTimes.push_back(darkTime);
+      CopyCubeIntoVector(file0, avgDarkLineCube0);
+      darkTimes.push_back(darkTime);
     }
   }
 
   /**
-  * This method copies cube into vector
-  * LRO calibration directory
-  *
-  * @param fileString QString pointer
-  * @param data vector of double
-  *
-  */
-  void CopyCubeIntoVector(QString &fileString, vector<double> &data) {
-    Cube cube;
-    FileName filename(fileString);
-    if(filename.isVersioned())
-      filename = filename.highestVersion();
-    if(!filename.fileExists()) {
-      QString msg = fileString + " does not exist.";
-      throw IException(IException::User, msg, _FILEINFO_);
+   * @brief This method returns a QString containing the path of an LRO calibration directory.
+   *
+   * @param[in] calibrationType
+   * @param[out] calibrationDirectory Path of the calibration directory
+   *
+   * @internal
+   *   @history 2020-01-06 Victor Silva - Added option for base calibration directory
+   */
+  static void GetCalibrationDirectory(QString calibrationType, QString &calibrationDirectory) {
+    PvlGroup &dataDir = Preference::Preferences().findGroup("DataDirectory");
+    QString missionDir = (QString) dataDir["LRO"];
+    if (calibrationType != "") {
+      calibrationType += "/";
     }
-    cube.open(filename.expanded());
-    Brick brick(cube.sampleCount(), cube.lineCount(), cube.bandCount(), cube.pixelType());
-    brick.SetBasePosition(1, 1, 1);
-    cube.read(brick);
-    data.clear();
-    for(int i = 0; i < cube.sampleCount(); i++)
-      data.push_back(brick[i]);
-
-    fileString = filename.original();
-
-    if(data.empty()){
-      QString msg = "Copy from + " + fileString + " into vector failed.";
-      throw IException(IException::User, msg, _FILEINFO_);
-    }
-
+    calibrationDirectory = missionDir + "/calibration/" + calibrationType;
   }
+
   /**
-  * Allow special pixel types
-  *
-  * @param pixelValue double
-  *
-  * @return bool
-  *
-  */
-  bool AllowedSpecialPixelType(double pixelValue) {
-    bool result = false;
-    result = result || IsHisPixel(pixelValue);
-    result = result || IsLisPixel(pixelValue);
-    result = result || IsHrsPixel(pixelValue);
-    result = result || IsLrsPixel(pixelValue);
+   * @brief Get weighted time averages for calculating pixel dark average.
+   *
+   * @param[in] imgTime Image time
+   * @param[in] darkTimes Dark times
+   * @param[out] weightedDarkTimeAvgs Weighted time averages w0 and w1 for dark file
+   *
+   */
+  static void GetWeightedDarkAverages(double imgTime, 
+                                      const std::vector<double> &darkTimes, 
+                                      std::vector<double> &weightedDarkTimeAvgs) {
+    int iTime = static_cast<int>(imgTime);
+    int t0 = 0;
+    int t1 = 0;
+
+    if (!darkTimes.empty()) {
+      if (darkTimes.size() == 2) {
+        t0 = darkTimes[0];
+        t1 = darkTimes[1];
+        double weight0 =
+        (( t1!=iTime ) * ( (t1 > iTime ) * ( t1 - iTime) ))
+        / (((( t1!=iTime ) * ( (t1 > iTime ) * ( t1 - iTime) )) +
+          (( t0!=iTime ) * ( (t0 < iTime ) * ( iTime - t0) )) ) * 1.0);
+
+        double weight1 = (( t0!=iTime ) * ( (t0 < iTime ) * ( iTime - t0) ))
+        / (((( t1!=iTime ) * ( (t1 > iTime ) * ( t1 - iTime) )) +
+          (( t0!=iTime ) * ( (t0 < iTime ) * ( iTime - t0) )) ) * 1.0);
+
+        weightedDarkTimeAvgs.clear();
+        weightedDarkTimeAvgs.push_back(weight0);
+        weightedDarkTimeAvgs.push_back(weight1);
+      }
+    }
+  }
+
+  /**
+   * @brief Allow special pixel types.
+   *
+   * @param pixelValue double
+   *
+   * @return bool
+   */
+  static bool AllowedSpecialPixelType(double pixelValue) {
+    bool result = IsHisPixel(pixelValue) 
+                || IsLisPixel(pixelValue) 
+                || IsHrsPixel(pixelValue) 
+                || IsLrsPixel(pixelValue);
     return result;
   }
 
   /**
-  * Get weighted time average for calculating pixel dark
-  * average
-  *
-  * @param w0 double Weighted Time Average for dark file
-  * @param w1 double Weighted time Average for dark file
-  *
-  */
-  void GetWeightedDarkAverages() {
+   * @brief Remove masked offset in-place.
+   *
+   * @param[in,out] inout Buffer
+   * @param[in] summed Summed
+   * @param[in] maskedLeftOnly Only left is masked
+   * @param[in] maskedPixelsLeft Left masked pixels
+   * @param[in] maskedPixelsRight Right masked pixels
+   */
+  static void RemoveMaskedOffset(Buffer &inout, 
+                                 bool summed,
+                                 bool maskedLeftOnly,
+                                 const std::vector<int> &maskedPixelsLeft, 
+                                 const std::vector<int> &maskedPixelsRight) {
+    int numMasked = MASKED_PIXEL_VALUES;
+    if (summed) {
+      numMasked /= 2;
+    }
 
-  int iTime = (int)g_imgTime;
-  int t0 = 0;
-  int t1 = 0;
+    std::vector<Statistics> statsLeft(numMasked, Statistics());
+    std::vector<Statistics> statsRight(numMasked, Statistics());
 
-  if (!g_darkTimes.empty()){
-    if (g_darkTimes.size() == 2){
-      t0 = g_darkTimes[0];
-      t1 = g_darkTimes[1];
-      double weight0 =
-      (( t1!=iTime ) * ( (t1 > iTime ) * ( t1 - iTime) ))
-      / (((( t1!=iTime ) * ( (t1 > iTime ) * ( t1 - iTime) )) +
-        (( t0!=iTime ) * ( (t0 < iTime ) * ( iTime - t0) )) ) * 1.0);
+    std::vector<int> leftRef(numMasked, 0);
+    std::vector<int> rightRef(numMasked, 0);
 
-      double weight1 = (( t0!=iTime ) * ( (t0 < iTime ) * ( iTime - t0) ))
-      / (((( t1!=iTime ) * ( (t1 > iTime ) * ( t1 - iTime) )) +
-        (( t0!=iTime ) * ( (t0 < iTime ) * ( iTime - t0) )) ) * 1.0);
+    for (std::size_t i = 0; i < maskedPixelsLeft.size(); i++) {
+      statsLeft[maskedPixelsLeft[i] % numMasked].AddData(&inout[maskedPixelsLeft[i]], 1);
+      leftRef[maskedPixelsLeft[i] % numMasked] += maskedPixelsLeft[i];
+    }
 
-      g_weightedDarkTimeAvgs.clear();
-      g_weightedDarkTimeAvgs.push_back(weight0);
-      g_weightedDarkTimeAvgs.push_back(weight1);
+    for (std::size_t i = 0; i < maskedPixelsRight.size(); i++) {
+      statsRight[maskedPixelsRight[i] % numMasked].AddData(&inout[maskedPixelsRight[i]], 1);
+      rightRef[maskedPixelsRight[i] % numMasked] += maskedPixelsRight[i];
+    }
+
+    // left/rightRef is the center (average) of all the masked pixels in the set
+    for (int i = 0; i < numMasked; i++) {
+      leftRef[i] /= statsLeft[i].TotalPixels();
+      rightRef[i] /= statsRight[i].TotalPixels();
+    }
+
+    if (maskedLeftOnly) {
+      for (int i = 0; i < inout.size(); i++) {
+        inout[i] -= statsLeft[i % numMasked].Average();
+      }
+    }
+    else {
+      // If we are using both sides, we interpolate between them
+
+      for (int i = 0; i < inout.size(); i++) {
+        inout[i] -= (statsLeft[i % numMasked].Average() * (rightRef[i % numMasked] - i) 
+                     + statsRight[i % numMasked].Average()
+                     * (i - leftRef[i % numMasked]))
+                  / (rightRef[i % numMasked] - leftRef[i % numMasked]);
+      }
+    }
+  }
+
+  /**
+   * @brief Performs dark correction of the pixel being processed in-place.
+   * 
+   * Dark correction will use the nearest dark pair if nearestDarkPair is true, otherwise it will 
+   * use the nearest dark file.
+   *
+   * @param[in,out] inout Buffer
+   * @param[in] nearestDarkPair Use nearest dark pair
+   * @param[in] avgDarkLineCube0 Average dark line cube 1
+   * @param[in] avgDarkLineCube1 Average dark line cube 2
+   * @param[in] weightedDarkTimeAvgs Weighted dark time averages
+   */
+  static void CorrectDark(Buffer &inout, 
+                          bool nearestDarkPair, 
+                          const std::vector<double> &avgDarkLineCube0, 
+                          const std::vector<double> &avgDarkLineCube1, 
+                          const std::vector<double> &weightedDarkTimeAvgs) {
+    for (int i = 0; i < inout.size(); i++) {
+      if (nearestDarkPair &&
+        (!IsSpecial(inout[i]) || AllowedSpecialPixelType(inout[i])) &&
+        (!IsSpecial(avgDarkLineCube0[i]) || AllowedSpecialPixelType(avgDarkLineCube0[i])) &&
+        (!IsSpecial(avgDarkLineCube1[i]) || AllowedSpecialPixelType(avgDarkLineCube1[i])) &&
+        (!IsSpecial(inout[i]) || AllowedSpecialPixelType(inout[i])) ) {
+        double w0 = weightedDarkTimeAvgs[0];
+        double w1 = weightedDarkTimeAvgs[1];
+        double pixelDarkAvg = (avgDarkLineCube0[i]*w0)+(avgDarkLineCube1[i]*w1);
+
+        inout[i] -= pixelDarkAvg;
+
+      } else if
+        ((!IsSpecial(avgDarkLineCube0[i]) || AllowedSpecialPixelType(avgDarkLineCube0[i])) &&
+        (!IsSpecial(inout[i]) || AllowedSpecialPixelType(inout[i])) ) {
+
+        inout[i] -= avgDarkLineCube0[i];
+
+      }
+      else {
+        inout[i] = Isis::Null;
+      }
+    }
+  }
+
+  /**
+   * @brief Correct non-linearity of the pixel being processed in-place.
+   *
+   * @param[in,out] inout Buffer
+   * @param[in] linearOffsetLine Linear offset line
+   * @param[in] linearityCoefficients Linearity coefficients
+   * @param[in] summed Summed
+   */
+  static void CorrectNonlinearity(Buffer &inout, 
+                                  const std::vector<double> &linearOffsetLine, 
+                                  const std::vector<std::vector<double>> &linearityCoefficients,
+                                  bool summed) {
+    for (int i = 0; i < inout.size(); i++) {
+      if (!IsSpecial(inout[i])) {
+        inout[i] += linearOffsetLine[i];
+
+        if (inout[i] < MAXNONLIN) {
+          if (summed) {
+            inout[i] -= (1.0 / (linearityCoefficients[2* i ][0]
+                                * pow(linearityCoefficients[2* i ][1], inout[i])
+                                + linearityCoefficients[2* i ][2])
+                         + 1.0 / (linearityCoefficients[2* i + 1][0] 
+                                  * pow(linearityCoefficients[2* i + 1][1], inout[i])
+                                  + linearityCoefficients[2* i + 1][2]))
+                      / 2;
+          }
+          else {
+            inout[i] -= 1.0 / (linearityCoefficients[i][0] 
+                               * pow(linearityCoefficients[i][1], inout[i])
+                               + linearityCoefficients[i][2]);
+          }
+        }
+      }
+      else
+        inout[i] = Isis::Null;
+    }
+  }
+
+  /**
+   * @brief Perform flatfield correction of the pixel being processed in-place.
+   * 
+   * @param[in,out] inout Buffer
+   * @param[in] flatfieldLine Flatfield line
+   */
+  static void CorrectFlatfield(Buffer &inout, const std::vector<double> &flatfieldLine) {
+    for (int i = 0; i < inout.size(); i++) {
+      if (!IsSpecial(inout[i]) && flatfieldLine[i] > 0) {
+        inout[i] /= flatfieldLine[i];
+      }
+      else {
+        inout[i] = Isis::Null;
+      }
+    }
+  }
+
+  /**
+   * @brief Perform radiometric calibration of the pixel being processed in-place.
+   *
+   * @param[in,out] inout Buffer
+   * @param[in] exposure Exposure
+   * @param[in] iof IOF
+   * @param[in] isLeftNac Is a left NAC
+   * @param[in] solarDistance Average solar distance in AU
+   * @param[in] iofLeft Left IOF
+   * @param[in] iofRight Right IOF 
+   * @param[in] radianceLeft Left radiance
+   * @param[in] radianceRight Right radiance
+   */
+  static void RadiometricCalibration(Buffer &inout, 
+                                     double exposure, 
+                                     bool iof, 
+                                     bool isLeftNac, 
+                                     double solarDistance,
+                                     double iofLeft, 
+                                     double iofRight, 
+                                     double radianceLeft, 
+                                     double radianceRight) {
+    for (int i = 0; i < inout.size(); i++) {
+      if (!IsSpecial(inout[i])) {
+        inout[i] /= exposure;
+        if (iof) {
+          if (isLeftNac) {
+            inout[i] = inout[i] * pow(solarDistance, 2) / iofLeft;
+          }
+          else {
+            inout[i] = inout[i] * pow(solarDistance, 2) / iofRight;
+          }
+        }
+        else {
+          if (isLeftNac) {
+            inout[i] = inout[i] / radianceLeft;
+          }
+          else {
+            inout[i] = inout[i] / radianceRight;
+          }
+        }
+      }
+      else {
+        inout[i] = Isis::Null;
       }
     }
   }
